@@ -2070,6 +2070,7 @@ proc makewindow {} {
     global highlight_files gdttype
     global searchstring sstring
     global bgcolor fgcolor bglist fglist diffcolors selectbgcolor
+    global highlightbgcolors
     global uifgcolor uifgdisabledcolor
     global filesepbgcolor filesepfgcolor
     global mergecolors foundbgcolor currentsearchhitbgcolor
@@ -2400,7 +2401,7 @@ proc makewindow {} {
     set worddiff [mc "Line diff"]
     if {[package vcompare $git_version "1.7.2"] >= 0} {
 	makedroplist .bleft.mid.worddiff worddiff [mc "Line diff"] \
-	    [mc "Markup words"] [mc "Color words"]
+	    [mc "Markup words"] [mc "Color words"] [mc "Highlight changes"]
 	trace add variable worddiff write changeworddiff
 	pack .bleft.mid.worddiff -side left -padx 5
     }
@@ -2431,6 +2432,8 @@ proc makewindow {} {
     $ctext tag conf hunksep -fore [lindex $diffcolors 2]
     $ctext tag conf d0 -fore [lindex $diffcolors 0]
     $ctext tag conf dresult -fore [lindex $diffcolors 1]
+    $ctext tag conf highlightd -back [lindex $highlightbgcolors 0]
+    $ctext tag conf highlighta -back [lindex $highlightbgcolors 1]
     $ctext tag conf m0 -fore [lindex $mergecolors 0]
     $ctext tag conf m1 -fore [lindex $mergecolors 1]
     $ctext tag conf m2 -fore [lindex $mergecolors 2]
@@ -7951,12 +7954,15 @@ proc changeworddiff {name ix op} {
 proc initblobdiffvars {} {
     global diffencoding targetline diffnparents
     global diffinhdr currdiffsubmod diffseehere
+    global highlightchunkadd highlightchunkdel
     set targetline {}
     set diffnparents 0
     set diffinhdr 0
     set diffencoding [get_path_encoding {}]
     set currdiffsubmod ""
     set diffseehere -1
+    set highlightchunkadd {}
+    set highlightchunkdel {}
 }
 
 proc getblobdiffs {ids} {
@@ -8100,6 +8106,7 @@ proc parseblobdiffline {ids line} {
     global diffinhdr treediffs mergemax diffnparents
     global diffencoding jump_to_here targetline diffline currdiffsubmod
     global worddiff diffseehere
+    global highlightchunkadd highlightchunkdel
 
     if {![string compare -length 5 "diff " $line]} {
 	if {![regexp {^diff (--cc|--git) } $line m type]} {
@@ -8232,13 +8239,15 @@ proc parseblobdiffline {ids line} {
 	# parse the prefix - one ' ', '-' or '+' for each parent
 	set prefix [string range $line 0 [expr {$diffnparents - 1}]]
 	set tag [expr {$diffnparents > 1? "m": "d"}]
-	set dowords [expr {$worddiff ne [mc "Line diff"] && $diffnparents == 1}]
+	set dowords [expr {$diffnparents == 1 && \
+	    ($worddiff eq [mc "Color words"] || $worddiff eq [mc "Markup words"])}]
+	set dohighlight [expr {$worddiff eq [mc "Highlight changes"] && $diffnparents == 1}]
 	set words_pre_markup ""
 	set words_post_markup ""
 	if {[string trim $prefix " -+"] eq {}} {
 	    # prefix only has " ", "-" and "+" in it: normal diff line
 	    set num [string first "-" $prefix]
-	    if {$dowords} {
+	    if {$dowords || $dohighlight} {
 		set line [string range $line 1 end]
 	    }
 	    if {$num >= 0} {
@@ -8248,10 +8257,12 @@ proc parseblobdiffline {ids line} {
 		}
 		if {$dowords && $worddiff eq [mc "Markup words"]} {
 		    $ctext insert end "\[-$line-\]" $tag$num
+		} elseif {$dohighlight} {
+		    lappend highlightchunkdel [list $line 1]
 		} else {
 		    $ctext insert end "$line" $tag$num
 		}
-		if {!$dowords} {
+		if {!$dowords && !$dohighlight} {
 		    $ctext insert end "\n" $tag$num
 		}
 	    } else {
@@ -8267,9 +8278,15 @@ proc parseblobdiffline {ids line} {
 			    }
 			    lappend tags m$num
 			}
+		    } elseif {$dohighlight} {
+		        lappend highlightchunkadd [list $line 1]
 		    }
 		    set words_pre_markup "{+"
 		    set words_post_markup "+}"
+		} elseif {$dohighlight} {
+		    # no change, add to both chunks
+		    lappend highlightchunkdel [list $line 0]
+		    lappend highlightchunkadd [list $line 0]
 		}
 		if {$targetline ne {}} {
 		    if {$diffline == $targetline} {
@@ -8281,21 +8298,78 @@ proc parseblobdiffline {ids line} {
 		}
 		if {$dowords && $worddiff eq [mc "Markup words"]} {
 		    $ctext insert end "$words_pre_markup$line$words_post_markup" $tags
-		} else {
+		} elseif {!$dohighlight} {
 		    $ctext insert end "$line" $tags
 		}
-		if {!$dowords} {
+		if {!$dowords && !$dohighlight} {
 		    $ctext insert end "\n" $tags
 		}
 	    }
 	} elseif {$dowords && $prefix eq "~"} {
 	    $ctext insert end "\n" {}
+	} elseif {$dohighlight && $prefix eq "~"} {
+	    flushhighlightchunks
 	} else {
 	    # "\ No newline at end of file",
 	    # or something else we don't recognize
 	    $ctext insert end "$line\n" hunksep
 	}
     }
+}
+
+proc flushhighlightchunks {} {
+    global highlightchunkadd highlightchunkdel ctext
+    set nadd 0
+    set tadd ""
+    foreach chunk $highlightchunkadd {
+        append tadd [lindex $chunk 0]
+        if [lindex $chunk 1] {
+            incr nadd
+        }
+    }
+    set ndel 0
+    set tdel ""
+    foreach chunk $highlightchunkdel {
+        append tdel [lindex $chunk 0]
+        if [lindex $chunk 1] {
+            incr ndel
+        }
+    }
+    if {$nadd == 0 && $ndel == 0} {
+        # unchanged line
+        $ctext insert end " $tadd\n" {}
+    } elseif {$nadd == 0 && [string trim $tadd] == ""} {
+        # line removed
+        $ctext insert end "-$tdel\n" "d0"
+    } elseif {$ndel == 0 && [string trim $tdel] == ""} {
+        # line added
+        $ctext insert end "+$tadd\n" "dresult"
+    } else {
+        # show first line with removals highlighted
+        $ctext insert end "-" "d0"
+        foreach chunk $highlightchunkdel {
+            lassign $chunk text highlight
+            if {$highlight} {
+                $ctext insert end $text {d0 highlightd}
+            } else {
+                $ctext insert end $text "d0"
+            }
+        }
+        $ctext insert end "\n" "d0"
+        # show second line with additions highlighted
+        $ctext insert end "+" "dresult"
+        foreach chunk $highlightchunkadd {
+            lassign $chunk text highlight
+            if {$highlight} {
+                $ctext insert end $text {dresult highlighta}
+            } else {
+                $ctext insert end $text "dresult"
+            }
+        }
+        $ctext insert end "\n" "dresult"
+    }
+    set highlightchunkadd {}
+    set highlightchunkdel {}
 }
 
 proc changediffdisp {} {
@@ -11553,7 +11627,8 @@ proc prefspage_general {notebook} {
 }
 
 proc prefspage_colors {notebook} {
-    global NS uicolor bgcolor fgcolor ctext diffcolors selectbgcolor markbgcolor
+    global NS uicolor bgcolor fgcolor ctext diffcolors selectbgcolor markbgcolor \
+        highlightbgcolors
 
     set page [create_prefs_page $notebook.colors]
 
@@ -11587,6 +11662,16 @@ proc prefspage_colors {notebook} {
 		      [mc "diff hunk header"] \
 		      [list $ctext tag conf hunksep -foreground]]
     grid x $page.hunksepbut $page.hunksep -sticky w
+    label $page.highlightdel -padx 40 -relief sunk -background [lindex $highlightbgcolors 0]
+    ${NS}::button $page.highlightdelbut -text [mc "Highlight removed bg"] \
+	-command [list choosecolor highlightbgcolors 0 $page.highlightdel [mc "highlight removed"] \
+		      [list $ctext tag conf highlightd -background]]
+    grid x $page.highlightdelbut $page.highlightdel -sticky w
+    label $page.highlightadd -padx 40 -relief sunk -background [lindex $highlightbgcolors 1]
+    ${NS}::button $page.highlightaddbut -text [mc "Highlight added bg"] \
+	-command [list choosecolor highlightbgcolors 1 $page.highlightadd [mc "highlight added"] \
+		      [list $ctext tag conf highlighta -background]]
+    grid x $page.highlightaddbut $page.highlightadd -sticky w
     label $page.markbgsep -padx 40 -relief sunk -background $markbgcolor
     ${NS}::button $page.markbgbut -text [mc "Marked line bg"] \
 	-command [list choosecolor markbgcolor {} $page.markbgsep \
@@ -12319,6 +12404,7 @@ if {[tk windowingsystem] eq "win32"} {
     set selectbgcolor gray85
 }
 set diffcolors {red "#00a000" blue}
+set highlightbgcolors {"#ffcccc" "#ccffcc"}
 set diffcontext 3
 set mergecolors {red blue "#00ff00" purple brown "#009090" magenta "#808000" "#009000" "#ff0080" cyan "#b07070" "#70b0f0" "#70f0b0" "#f0b070" "#ff70b0"}
 set ignorespace 0
@@ -12390,6 +12476,7 @@ set config_variables {
     filesepbgcolor filesepfgcolor linehoverbgcolor linehoverfgcolor
     linehoveroutlinecolor mainheadcirclecolor workingfilescirclecolor
     indexcirclecolor circlecolors linkfgcolor circleoutlinecolor
+    highlightbgcolors
 }
 foreach var $config_variables {
     config_init_trace $var
